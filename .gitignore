@@ -1,0 +1,9 @@
+*.parquet
+*.json
+*.csv
+*.txt
+*.arrow
+*.env
+.env
+.DS_Store
+.venv/
