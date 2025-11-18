@@ -2,16 +2,15 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from tavily import TavilyClient
 import os
+from dotenv import load_dotenv
+import json
 
-class QuestionToAnswerT(BaseModel):
-    question: str
-    description: str
-    outcomes: list[str]
-    winning_outcome: str
-    time_of_resolution: datetime
+load_dotenv()
 
 
-def search_the_web(query: str, only_results_before: datetime) -> list[dict]:
+ONLY_RESULTS_BEFORE =datetime(2023, 3, 12)
+
+def search_the_web(query: str) -> list[dict]:
     """
     Search the web using Tavily API and return only pages published before the specified datetime.
     
@@ -33,15 +32,26 @@ def search_the_web(query: str, only_results_before: datetime) -> list[dict]:
     tavily_client = TavilyClient(api_key=api_key)
     
     # Convert datetime to YYYY-MM-DD format for the API
-    end_date_str = only_results_before.strftime("%Y-%m-%d")
-    
+    end_date_str = ONLY_RESULTS_BEFORE.strftime("%Y-%m-%d")
+    print(end_date_str)
     # Perform the search with end_date parameter to filter results
     response = tavily_client.search(
         query=query,
-        end_date=end_date_str
+        end_date=end_date_str,
+        topic="news"
     )
     
     # Return the filtered results (API handles filtering by date)
     return response.get('results', [])
 
-print(search_the_web("When was Tokyo built?", datetime.now() - timedelta(months=7)))
+resp = (search_the_web("India"))
+
+print(json.dumps(resp, indent=4))
+
+
+class QuestionToAnswerT(BaseModel):
+    question: str
+    description: str
+    outcomes: list[str]
+    winning_outcome: str
+    time_of_resolution: datetime

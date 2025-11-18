@@ -425,6 +425,11 @@ class KalshiDataExtractor(PredictionMarketDataExtractor):
                         "mve_selected_legs": str(market.get("mve_selected_legs", [])) if market.get("mve_selected_legs") else "",
                         # Store original full response for future feature recovery
                         "original": {"market": json.dumps(market), "event": json.dumps(event)},
+                        "event_sub_title": event.get("sub_title", ""),
+                        "event_collateral_return_type": event.get("collateral_return_type", ""),
+                        "event_mutually_exclusive": event.get("mutually_exclusive", False),
+                        "event_strike_date": event.get("strike_date", ""),
+                        "event_strike_period": market.get("strike_period", ""),
                     }
                     markets.append(market_info)
             
@@ -502,6 +507,11 @@ class KalshiDataExtractor(PredictionMarketDataExtractor):
             "mve_collection_ticker": Value("string"),
             "mve_selected_legs": Value("string"),
             "original": Value("string"),  # Full original JSON response
+            "event_sub_title": Value("string"),
+            "event_collateral_return_type": Value("string"),
+            "event_mutually_exclusive": Value("bool"),
+            "event_strike_date": Value("string"),
+            "event_strike_period": Value("string"),
         })
     
     def to_unified_format(self, market: dict) -> dict:
@@ -537,6 +547,11 @@ class KalshiDataExtractor(PredictionMarketDataExtractor):
             "market_type": str(market.get("market_type", "")),
             "original": str(market.get("original", "")),
             "series_ticker": str(market.get("series_ticker", "")),
+            "event_sub_title": str(market.get("event_sub_title", "")),
+            "event_collateral_return_type": str(market.get("event_collateral_return_type", "")),
+            "event_mutually_exclusive": bool(market.get("event_mutually_exclusive", False)),
+            "event_strike_date": str(market.get("event_strike_date", "")),
+            "event_strike_period": str(market.get("event_strike_period", "")),
         }
 
 
@@ -583,6 +598,11 @@ class PredictionMarketDataOrchestrator:
             "market_type": Value("string"),
             "original": Value("string"),  # Full original JSON response
             "series_ticker": Value("string"),
+            "event_sub_title": Value("string"),
+            "event_collateral_return_type": Value("string"),
+            "event_mutually_exclusive": Value("bool"),
+            "event_strike_date": Value("string"),
+            "event_strike_period": Value("string"),
         })
     
     def _convert_to_unified(self, datasets: dict[str, Dataset], extractors_map: dict[str, PredictionMarketDataExtractor]) -> Dataset:
