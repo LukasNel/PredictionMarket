@@ -6,31 +6,25 @@ by following links. Uses the wikipedia-api library for cleaner API access.
 
 Install requirements:
     pip install openai-harmony transformers torch accelerate triton==3.4 kernels
-    pip install wikipedia-api pydantic
+    pip install wikipedia-api pydantic trl datasets wandb tavily-python python-dotenv
 """
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
 from datetime import datetime
 import json
-import re
 import wikipediaapi
-from typing import Any
 import traceback
 from io import StringIO
 import sys
-from abc import ABC, abstractmethod
-from pydantic import BaseModel
-from datetime import datetime, timedelta
 from tavily import TavilyClient
 import os
 from dotenv import load_dotenv
-import json
-import re
 import torch
+import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
 from datasets import Dataset
 import wandb
+import torch.nn.functional as F
 from openai_harmony import (
     Author,
     Conversation,
@@ -49,8 +43,10 @@ try:
     os.environ['TAVILY_API_KEY'] = userdata.get('TAVILY_API_KEY')
 except ImportError:
     # Not in Colab, load from .env
-    load_dotenv()
+    print("Not in Colab, loading from .env")
+    # load_dotenv()
 
+TARGET_PAGE = "Adolf Hitler"
 class QuestionToAnswerT(BaseModel):
     question: str
     description: str
@@ -373,7 +369,7 @@ class GPTOSSExecutor:
 class WikipediaNavigator:
     """Handles Wikipedia navigation and link extraction using wikipedia-api."""
     
-    def __init__(self, target_page: str = "Adolf_Hitler"):
+    def __init__(self, target_page: str = TARGET_PAGE):
         self.target_page = target_page
         self.current_page = None
         self.history = []
@@ -388,30 +384,10 @@ class WikipediaNavigator:
     
     def get_random_page(self) -> str:
         """Get a random Wikipedia page title."""
-        import requests
-        
-        url = "https://en.wikipedia.org/w/api.php"
-        params = {
-            "action": "query",
-            "format": "json",
-            "list": "random",
-            "rnnamespace": "0",  # Main namespace (articles only)
-            "rnlimit": "1"
-        }
-        
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            random_page = data["query"]["random"][0]["title"]
-            print(f"Random page selected: {random_page}")
-            return random_page
-            
-        except Exception as e:
-            print(f"Error getting random page: {e}")
-            # Fallback to a default page
-            return "Philosophy"
+        headers = {'User-Agent': '2084Collective (lukas@nelsoftware.com)'}
+        req = requests.get("https://en.wikipedia.org/api/rest_v1/page/random/summary", headers=headers)
+        title = json.loads(req.content)["title"]
+        return title
 
     def get_page_links(self, page_title: str) -> list[str]:
         """Get all valid Wikipedia links from a page."""
@@ -588,7 +564,7 @@ class CodeExecutorTool(BaseTool):
 class WikipediaGame:
     """Main game coordinator using GPT-OSS Executor."""
     
-    def __init__(self, executor, start_page: str, target_page: str = "Adolf_Hitler"):
+    def __init__(self, executor, start_page: str, target_page: str = TARGET_PAGE):
         """
         Initialize the Wikipedia navigation game.
         
@@ -789,40 +765,414 @@ Choose your next link to get closer to {self.target_page}."""
             "path": self.navigator.history,
             "steps": len(self.navigator.history),
             "iterations": iteration,
-            "target_reached": self.navigator.current_page == self.target_page
+            "target_reached": self.navigator.current_page == self.target_page,
+            "conversation": result.conversation
         }
+
+
+def compute_grpo_loss(
+    logprobs: torch.Tensor,  # [group_size, seq_len] - log probs from model
+    ref_logprobs: torch.Tensor,  # [group_size, seq_len] - log probs from reference model
+    rewards: torch.Tensor,  # [group_size] - reward for each completion
+    clip_ratio: float = 0.2,
+    beta: float = 0.0  # KL penalty (default 0.0 as per recent GRPO practices)
+) -> dict:
+    """
+    Compute GRPO loss with group relative advantages.
+    
+    Args:
+        logprobs: Log probabilities from current policy [group_size, seq_len]
+        ref_logprobs: Log probabilities from reference policy [group_size, seq_len]
+        rewards: Rewards for each completion in the group [group_size]
+        clip_ratio: PPO clipping ratio (epsilon)
+        beta: KL divergence penalty coefficient
+    
+    Returns:
+        Dictionary with loss and statistics
+    """
+    # Normalize rewards within the group (Group Relative)
+    advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+    
+    # Sum log probs over sequence length to get per-completion log prob
+    logprob_sum = logprobs.sum(dim=1)  # [group_size]
+    ref_logprob_sum = ref_logprobs.sum(dim=1)  # [group_size]
+    
+    # Compute probability ratio
+    log_ratio = logprob_sum - ref_logprob_sum
+    ratio = torch.exp(log_ratio)
+    
+    # Clipped surrogate objective
+    clip_ratio_low = 1.0 - clip_ratio
+    clip_ratio_high = 1.0 + clip_ratio
+    
+    loss_unclipped = -advantages * ratio
+    loss_clipped = -advantages * torch.clamp(ratio, clip_ratio_low, clip_ratio_high)
+    loss_policy = torch.max(loss_unclipped, loss_clipped).mean()
+    
+    # KL divergence (optional, default beta=0.0)
+    kl_div = (log_ratio).mean()
+    loss_kl = beta * kl_div
+    
+    total_loss = loss_policy + loss_kl
+    
+    # Statistics
+    clip_frac_low = ((ratio < clip_ratio_low).float().mean()).item()
+    clip_frac_high = ((ratio > clip_ratio_high).float().mean()).item()
+    
+    return {
+        "loss": total_loss,
+        "loss_policy": loss_policy.item(),
+        "loss_kl": loss_kl.item(),
+        "mean_advantage": advantages.mean().item(),
+        "mean_reward": rewards.mean().item(),
+        "mean_ratio": ratio.mean().item(),
+        "clip_frac_low": clip_frac_low,
+        "clip_frac_high": clip_frac_high,
+        "kl_div": kl_div.item()
+    }
+
+
+def extract_logprobs_from_conversation(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    encoding,
+    conversation: list[dict]
+) -> torch.Tensor:
+    """
+    Extract log probabilities from a conversation by reconstructing it.
+    Returns log probs for all assistant tokens (excluding tool outputs which are masked).
+    
+    IMPORTANT: Tool outputs are NOT trained on - they come from the environment.
+    Only assistant reasoning, tool calls, and final answers are trained.
+    """
+    # Convert conversation dict back to Harmony Conversation
+    convo = Conversation.from_dict({"messages": conversation})
+    
+    # Collect all assistant message tokens with their positions
+    all_logprobs = []
+    
+    # Find assistant messages (skip tool messages)
+    for i, msg in enumerate(convo.messages):
+        msg_dict = msg.to_dict()
+        role = msg_dict.get("role")
+        
+        # Only train on assistant messages, NOT tool responses
+        if role == "assistant":
+            # Get conversation up to this point
+            context_convo = Conversation.from_messages(list(convo.messages)[:i])
+            
+            # Render context
+            context_ids = encoding.render_conversation_for_completion(context_convo, Role.ASSISTANT)
+            
+            # Get the assistant message tokens
+            assistant_ids = encoding.render_message_for_completion(msg)
+            
+            # Full input: context + assistant message
+            full_ids = context_ids + assistant_ids
+            
+            # Get model logprobs
+            with torch.no_grad():
+                input_tensor = torch.tensor([full_ids], dtype=torch.long).to(model.device)
+                outputs = model(input_tensor)
+                logits = outputs.logits[0]  # [seq_len, vocab_size]
+                
+                # Get log probs for assistant tokens
+                # We want logprobs for positions [len(context_ids):len(full_ids)-1]
+                # predicting tokens at positions [len(context_ids)+1:len(full_ids)]
+                start_idx = len(context_ids)
+                end_idx = len(full_ids)
+                
+                for pos in range(start_idx, end_idx - 1):
+                    next_token = full_ids[pos + 1]
+                    token_logprobs = F.log_softmax(logits[pos], dim=-1)
+                    logprob = token_logprobs[next_token]
+                    all_logprobs.append(logprob)
+        
+        # Skip tool messages - they are environment responses, not model outputs
+        elif role == "tool":
+            continue
+    
+    if not all_logprobs:
+        # No assistant tokens found, return dummy
+        return torch.tensor([0.0], device=model.device)
+    
+    return torch.stack(all_logprobs)
+
+
+def train(
+    model_name: str = "openai/gpt-oss-20b",
+    num_iterations: int = 100,
+    num_starting_pages: int = 50,
+    group_size: int = 4,  # Number of games to play per starting page
+    learning_rate: float = 1.41e-5,
+    num_epochs_per_iteration: int = 4,
+    max_game_iterations: int = 25,
+    wandb_project: str = "wikipedia-game-grpo",
+    save_dir: str = "./trained_wikipedia_model",
+    clip_ratio: float = 0.2,
+    beta: float = 0.0  # KL penalty
+):
+    """
+    Train the model to play the Wikipedia game using GRPO.
+    
+    Args:
+        model_name: HuggingFace model identifier
+        num_iterations: Number of training iterations
+        num_starting_pages: Number of different starting pages to use
+        group_size: Number of games per starting page (for group relative comparison)
+        learning_rate: Learning rate for optimizer
+        num_epochs_per_iteration: Number of optimization epochs per iteration
+        max_game_iterations: Max iterations per game
+        wandb_project: W&B project name
+        save_dir: Directory to save trained model
+        clip_ratio: PPO clipping ratio
+        beta: KL divergence penalty coefficient
+    """
+    # Initialize wandb
+    wandb.init(
+        project=wandb_project,
+        config={
+            "model_name": model_name,
+            "num_iterations": num_iterations,
+            "group_size": group_size,
+            "learning_rate": learning_rate,
+            "num_epochs_per_iteration": num_epochs_per_iteration,
+            "max_game_iterations": max_game_iterations,
+            "clip_ratio": clip_ratio,
+            "beta": beta
+        }
+    )
+    
+    print("Initializing model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype="auto",
+        device_map="auto"
+    )
+    
+    # Create reference model (frozen copy)
+    print("Creating reference model...")
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype="auto",
+        device_map="auto"
+    )
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad = False
+    
+    # Create executor
+    executor = GPTOSSExecutor(model_name=model_name)
+    executor.model = model
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Generate dataset of starting pages
+    print(f"Generating {num_starting_pages} random starting pages...")
+    navigator = WikipediaNavigator()
+    starting_pages = []
+    for _ in range(num_starting_pages):
+        page = navigator.get_random_page()
+        starting_pages.append(page)
+    
+    print(f"Starting GRPO training for {num_iterations} iterations...")
+    
+    # Training loop
+    for iteration in range(num_iterations):
+        print(f"\n{'='*80}")
+        print(f"ITERATION {iteration + 1}/{num_iterations}")
+        print(f"{'='*80}")
+        
+        # Sample a starting page
+        start_page = starting_pages[iteration % len(starting_pages)]
+        
+        print(f"Starting page: {start_page}")
+        print(f"Playing {group_size} games from this page...")
+        
+        # Play multiple games from same starting page (generate group of completions)
+        group_results = []
+        group_rewards = []
+        
+        for g in range(group_size):
+            print(f"\n--- Game {g+1}/{group_size} ---")
+            
+            game = WikipediaGame(
+                executor=executor,
+                start_page=start_page,
+                target_page=TARGET_PAGE
+            )
+            
+            result = game.play(max_iterations=max_game_iterations)
+            
+            # Calculate reward
+            if result.get("error"):
+                reward = -10.0
+            elif result["target_reached"]:
+                steps = result["steps"]
+                reward = 100.0 - (steps * 2.0)
+            else:
+                reward = -5.0
+            
+            group_results.append(result)
+            group_rewards.append(reward)
+            
+            print(f"Result: {'SUCCESS' if result.get('target_reached') else 'FAILED'}")
+            print(f"Steps: {result.get('steps', 0)}")
+            print(f"Reward: {reward:.2f}")
+        
+        # Extract log probs from conversations
+        print("\nExtracting log probabilities from conversations...")
+        group_logprobs = []
+        group_ref_logprobs = []
+        
+        encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+        
+        for result in group_results:
+            conversation = result.get("conversation", [])
+            
+            # Get logprobs from current model
+            logprobs = extract_logprobs_from_conversation(
+                model, tokenizer, encoding, conversation
+            )
+            group_logprobs.append(logprobs)
+            
+            # Get logprobs from reference model
+            ref_logprobs = extract_logprobs_from_conversation(
+                ref_model, tokenizer, encoding, conversation
+            )
+            group_ref_logprobs.append(ref_logprobs)
+        
+        # Pad sequences to same length
+        max_len = max(lp.shape[0] for lp in group_logprobs)
+        padded_logprobs = []
+        padded_ref_logprobs = []
+        
+        for lp, ref_lp in zip(group_logprobs, group_ref_logprobs):
+            if lp.shape[0] < max_len:
+                padding = torch.zeros(max_len - lp.shape[0], device=lp.device)
+                lp = torch.cat([lp, padding])
+                ref_lp = torch.cat([ref_lp, padding])
+            padded_logprobs.append(lp)
+            padded_ref_logprobs.append(ref_lp)
+        
+        logprobs_tensor = torch.stack(padded_logprobs)  # [group_size, max_len]
+        ref_logprobs_tensor = torch.stack(padded_ref_logprobs)  # [group_size, max_len]
+        rewards_tensor = torch.tensor(group_rewards, device=model.device)  # [group_size]
+        
+        # Multiple epochs over same data
+        print(f"\nOptimizing for {num_epochs_per_iteration} epochs...")
+        for epoch in range(num_epochs_per_iteration):
+            optimizer.zero_grad()
+            
+            # Compute GRPO loss
+            loss_dict = compute_grpo_loss(
+                logprobs_tensor,
+                ref_logprobs_tensor,
+                rewards_tensor,
+                clip_ratio=clip_ratio,
+                beta=beta
+            )
+            
+            loss = loss_dict["loss"]
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            print(f"Epoch {epoch+1}/{num_epochs_per_iteration}: Loss = {loss.item():.4f}")
+        
+        # Log to wandb
+        wandb.log({
+            "iteration": iteration + 1,
+            "start_page": start_page,
+            "mean_reward": loss_dict["mean_reward"],
+            "loss": loss_dict["loss"],
+            "loss_policy": loss_dict["loss_policy"],
+            "loss_kl": loss_dict["loss_kl"],
+            "mean_advantage": loss_dict["mean_advantage"],
+            "mean_ratio": loss_dict["mean_ratio"],
+            "clip_frac_low": loss_dict["clip_frac_low"],
+            "clip_frac_high": loss_dict["clip_frac_high"],
+            "kl_div": loss_dict["kl_div"],
+            "successes": sum(1 for r in group_results if r.get("target_reached", False)),
+            "mean_steps": sum(r.get("steps", 0) for r in group_results) / len(group_results)
+        })
+        
+        # Save checkpoint every 10 iterations
+        if (iteration + 1) % 10 == 0:
+            checkpoint_dir = f"{save_dir}/checkpoint-{iteration + 1}"
+            print(f"\nSaving checkpoint to {checkpoint_dir}")
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+    
+    # Save final model
+    print(f"\nSaving final model to {save_dir}")
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    
+    wandb.finish()
+    print("Training complete!")
 
 
 # Example usage
 if __name__ == "__main__":
-    executor = GPTOSSExecutor(model_name="openai/gpt-oss-20b")
+    import sys
     
-    # Create and play the game
-    game = WikipediaGame(
-        executor=executor,
-        start_page=WikipediaNavigator().get_random_page(),
-        target_page="Adolf Hitler"
-    )
-    
-    print("🎮 Starting Wikipedia Navigation Game!")
-    print(f"Start: Philosophy")
-    print(f"Target: Adolf_Hitler")
-    print(f"Max steps: 20\n")
-    
-    result = game.play(max_iterations=25)
-    
-    print("\n" + "="*60)
-    print("GAME COMPLETE")
-    print("="*60)
-    
-    if result.get('error'):
-        print(f"Error: {result['error']}")
+    # Check if we should train or just play
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
+        # Training mode
+        print("🎓 Starting GRPO Training...")
+        train(
+            num_iterations=100,
+            num_starting_pages=50,
+            group_size=4,
+            learning_rate=1.41e-5,
+            num_epochs_per_iteration=4,
+            max_game_iterations=25,
+            wandb_project="wikipedia-game-grpo",
+            save_dir="./trained_wikipedia_model",
+            clip_ratio=0.2,
+            beta=0.0
+        )
     else:
-        print(f"Success: {result['success']}")
-        print(f"Steps taken: {result['steps']}")
-        print(f"Path: {' → '.join(result['path'])}")
+        # Demo mode - just play one game
+        executor = GPTOSSExecutor(model_name="openai/gpt-oss-20b")
         
-        if result['success']:
-            print(f"\n🎉 Successfully reached {game.target_page}!")
+        # Create and play the game
+        game = WikipediaGame(
+            executor=executor,
+            start_page=WikipediaNavigator().get_random_page(),
+            target_page=TARGET_PAGE
+        )
+        
+        print("🎮 Starting Wikipedia Navigation Game!")
+        print(f"Target: {TARGET_PAGE}")
+        print(f"Max steps: 20\n")
+        
+        result = game.play(max_iterations=25)
+        
+        print("\n" + "="*60)
+        print("GAME COMPLETE")
+        print("="*60)
+        
+        if result.get('error'):
+            print(f"Error: {result['error']}")
         else:
-            print(f"\n😞 Did not reach target in {game.navigator.max_steps} steps")
+            print(f"Success: {result['success']}")
+            print(f"Steps taken: {result['steps']}")
+            print(f"Path: {' → '.join(result['path'])}")
+            
+            if result['success']:
+                print(f"\n🎉 Successfully reached {game.target_page}!")
+            else:
+                print(f"\n😞 Did not reach target in {game.navigator.max_steps} steps")
+
+
